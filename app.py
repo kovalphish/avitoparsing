@@ -1,15 +1,28 @@
 import time
 import sqlite3
-import datetime
 import json
 import re
 import random
 import urllib.parse
+import threading
+import os
 from curl_cffi import requests
 from bs4 import BeautifulSoup
-from telebot import TeleBot, types # Добавили types для кнопок
+from telebot import TeleBot, types
+from flask import Flask
 
-# --- НАСТРОЙКИ ---
+# --- ВЕБ-ЗАТЫЧКА ДЛЯ KOYEB ---
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Бот работает!"
+
+def run_flask():
+    # Слушаем порт 8000, который требует Koyeb
+    app.run(host='0.0.0.0', port=8000)
+
+# --- НАСТРОЙКИ БОТА ---
 TOKEN = "8570991374:AAGOxulL0W679vZ6g4P0HhbAkqY14JxhhU8"
 bot = TeleBot(TOKEN)
 
@@ -23,11 +36,9 @@ def init_db():
 
 db_conn, db_cur = init_db()
 
-# Функция создания кнопок
 def main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    btn_stop = types.KeyboardButton("❌ Остановить мониторинг")
-    markup.add(btn_stop)
+    markup.add(types.KeyboardButton("❌ Остановить мониторинг"))
     return markup
 
 def get_avito_data(url):
@@ -37,7 +48,6 @@ def get_avito_data(url):
         resp = session.get(url, headers=headers, impersonate="chrome110", timeout=20)
         if resp.status_code == 403: return None, []
         soup = BeautifulSoup(resp.text, 'html.parser')
-        
         catalog_info = {}
         script = soup.find("script", string=re.compile("window.__initialData__"))
         if script:
@@ -52,63 +62,40 @@ def get_avito_data(url):
                                 'img': it.get('images', [{}])[0].get('636x476')
                             }
             except: pass
-        items = soup.find_all('div', {'data-marker': 'item'})
-        return catalog_info, items
+        return catalog_info, soup.find_all('div', {'data-marker': 'item'})
     except: return None, []
 
 def send_ad(chat_id, item, info):
-    ad_id = str(item.get('data-item-id'))
-    title_tag = item.find('a', {'data-marker': 'item-title'})
-    if not title_tag: return
-    title = title_tag.get('title', '').replace('купить в Челябинске на Авито', '').strip()
-    try: price = item.find('meta', {'itemprop': 'price'}).get('content') + " ₽"
-    except: price = "Цена не указана"
-    link = "https://www.avito.ru" + title_tag['href']
-    extra = info.get(ad_id, {})
-    photo = extra.get('img') or (item.find('img').get('src') if item.find('img') else None)
-    description = extra.get('desc') or "Описание доступно по ссылке"
-
-    caption = (f"<b>{title}</b>\n💰 <b>{price}</b>\n📍 Челябинск\n\n🔗 <a href='{link}'>Открыть на Avito</a>\n"
-               f"________________________\n📝 {description[:350]}...")
     try:
-        if photo: bot.send_photo(chat_id, photo, caption=caption, parse_mode="HTML", reply_markup=main_menu())
-        else: bot.send_message(chat_id, caption, parse_mode="HTML", reply_markup=main_menu())
+        ad_id = str(item.get('data-item-id'))
+        title_tag = item.find('a', {'data-marker': 'item-title'})
+        if not title_tag: return
+        title = title_tag.get('title', '').replace('купить в Челябинске на Авито', '').strip()
+        try: price = item.find('meta', {'itemprop': 'price'}).get('content') + " ₽"
+        except: price = "Цена не указана"
+        link = "https://www.avito.ru" + title_tag['href']
+        extra = info.get(ad_id, {})
+        photo = extra.get('img')
+        caption = f"<b>{title}</b>\n💰 <b>{price}</b>\n\n🔗 <a href='{link}'>Открыть</a>"
+        if photo: bot.send_photo(chat_id, photo, caption=caption, parse_mode="HTML")
+        else: bot.send_message(chat_id, caption, parse_mode="HTML")
     except: pass
 
 @bot.message_handler(commands=['start'])
 def welcome(message):
-    bot.reply_to(message, "Пришли ссылку на поиск Авито для мониторинга.", reply_markup=main_menu())
-
-# ОБРАБОТКА КНОПКИ ОТМЕНЫ
-@bot.message_handler(func=lambda m: m.text == "❌ Остановить мониторинг")
-def stop_monitoring(message):
-    chat_id = message.chat.id
-    db_cur.execute("DELETE FROM users WHERE chat_id = ?", (chat_id,))
-    db_conn.commit()
-    bot.send_message(chat_id, "⏹ Мониторинг остановлен. Твоя ссылка удалена. Чтобы начать заново — просто пришли новую ссылку.")
+    bot.reply_to(message, "Пришли ссылку на Авито.", reply_markup=main_menu())
 
 @bot.message_handler(func=lambda m: "avito.ru" in m.text)
 def set_link(message):
-    chat_id = message.chat.id
-    url = message.text.strip()
-    db_cur.execute("INSERT OR REPLACE INTO users (chat_id, url) VALUES (?, ?)", (chat_id, url))
+    db_cur.execute("INSERT OR REPLACE INTO users (chat_id, url) VALUES (?, ?)", (message.chat.id, message.text.strip()))
     db_conn.commit()
-    bot.send_message(chat_id, "✅ Ссылка принята! Мониторинг запущен.", reply_markup=main_menu())
-    
-    info, items = get_avito_data(url)
-    if items:
-        for item in items:
-            ad_id = str(item.get('data-item-id'))
-            db_cur.execute("INSERT OR IGNORE INTO ads (ad_id) VALUES (?)", (ad_id,))
-        db_conn.commit()
-        send_ad(chat_id, items[0], info)
+    bot.send_message(message.chat.id, "✅ Мониторинг запущен!")
 
 def check_updates():
     while True:
         try:
             db_cur.execute("SELECT chat_id, url FROM users")
-            users = db_cur.fetchall()
-            for chat_id, url in users:
+            for chat_id, url in db_cur.fetchall():
                 info, items = get_avito_data(url)
                 if items:
                     for item in items:
@@ -122,7 +109,17 @@ def check_updates():
         time.sleep(random.randint(180, 300))
 
 if __name__ == "__main__":
-    import threading
+    # 1. Запуск Flask в отдельном потоке (для Koyeb)
+    threading.Thread(target=run_flask, daemon=True).start()
+    
+    # 2. Запуск мониторинга Авито
     threading.Thread(target=check_updates, daemon=True).start()
-    print("🚀 Бот с кнопкой отмены запущен!")
-    bot.polling(none_stop=True)
+    
+    # 3. Запуск бота Telegram
+    print("🚀 Бот запущен с веб-затычкой на порту 8000!")
+    while True:
+        try:
+            bot.polling(none_stop=True, timeout=60)
+        except Exception as e:
+            print(f"Ошибка: {e}")
+            time.sleep(5)

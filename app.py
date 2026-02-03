@@ -133,18 +133,32 @@ def set_link(message):
 
 # --- 6. ЗАПУСК ---
 if __name__ == "__main__":
-    # Запуск Flask в потоке
+    # 1. Запуск Flask
     threading.Thread(target=run_flask, daemon=True).start()
     
-    # Запуск мониторинга в потоке
+    # 2. Очистка старых вебхуков/сессий (лечит ошибку 409)
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+    except:
+        pass
+    
+    # 3. Запуск мониторинга
     threading.Thread(target=check_updates, daemon=True).start()
     
     print("🚀 Бот успешно запущен!")
     
-    # Запуск Telegram бота
+    # 4. Запуск бота с автоматическим пропуском ошибок
     while True:
         try:
-            bot.polling(none_stop=True, interval=0, timeout=20)
+            bot.polling(none_stop=True, interval=2, timeout=20) # interval=2 дает паузу между запросами к API Telegram
+        except ApiTelegramException as e:
+            if e.error_code == 409:
+                print("⚠️ Конфликт (409). Ждем завершения другой копии...")
+                time.sleep(10)
+            else:
+                print(f"⚠️ Ошибка Telegram API: {e}")
+                time.sleep(5)
         except Exception as e:
-            print(f"⚠️ Ошибка Polling: {e}")
+            print(f"⚠️ Неизвестная ошибка: {e}")
             time.sleep(5)

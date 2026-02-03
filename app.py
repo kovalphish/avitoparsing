@@ -119,12 +119,13 @@ def check_updates():
                             db_cur.execute("INSERT INTO ads (ad_id) VALUES (?)", (ad_id,))
                             db_conn.commit()
         except: pass
-        time.sleep(random.randint(30, 70))
+        time.sleep(random.randint(500, 700))
 
 if __name__ == "__main__":
     import threading
     threading.Thread(target=check_updates, daemon=True).start()
     print("🚀 Бот с кнопкой отмены запущен!")
     bot.polling(none_stop=True)
+
 
 

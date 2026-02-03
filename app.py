@@ -109,17 +109,23 @@ def check_updates():
         time.sleep(random.randint(180, 300))
 
 if __name__ == "__main__":
-    # 1. Запуск Flask в отдельном потоке (для Koyeb)
-    threading.Thread(target=run_flask, daemon=True).start()
+    # 1. Запуск веб-затычки для Koyeb
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
     
-    # 2. Запуск мониторинга Авито
-    threading.Thread(target=check_updates, daemon=True).start()
+    # 2. Запуск мониторинга Авито в фоне
+    monitor_thread = threading.Thread(target=check_updates, daemon=True)
+    monitor_thread.start()
     
-    # 3. Запуск бота Telegram
-    print("🚀 Бот запущен с веб-затычкой на порту 8000!")
+    print("🚀 Бот запущен и готов к работе!")
+
+    # 3. Запуск самого бота с уменьшенным временем ожидания
     while True:
         try:
-            bot.polling(none_stop=True, timeout=60)
+            # interval=0 делает бота более отзывчивым на команды
+            # timeout=20 - оптимально для стабильной связи
+            bot.polling(none_stop=True, interval=0, timeout=20)
         except Exception as e:
-            print(f"Ошибка: {e}")
+            print(f"⚠️ Ошибка связи: {e}")
             time.sleep(5)
+

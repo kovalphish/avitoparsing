@@ -5,10 +5,11 @@ import re
 import random
 import urllib.parse
 import logging
-from threading import Lock
-from curl_cffi import requests
+from threading import Lock, Thread
+import requests
 from bs4 import BeautifulSoup
 from telebot import TeleBot, types
+import concurrent.futures
 
 # --- НАСТРОЙКИ И ЛОГИРОВАНИЕ ---
 TOKEN = "8570991374:AAGOxulL0W679vZ6g4P0HhbAkqY14JxhhU8"
@@ -16,46 +17,53 @@ bot = TeleBot(TOKEN)
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
 # Блокировка для работы с БД
 db_lock = Lock()
 
+# Прокси (опционально, если нужен)
+PROXIES = None  # {"http": "http://proxy:port", "https": "http://proxy:port"}
+
 def init_db():
     """Инициализация базы данных"""
-    conn = sqlite3.connect("monitor_bot.db", check_same_thread=False)
+    conn = sqlite3.connect("monitor_bot.db", check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     
-    # Таблица пользователей
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             chat_id INTEGER PRIMARY KEY,
             url TEXT,
             active BOOLEAN DEFAULT 1,
+            last_check TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     
-    # Таблица объявлений с привязкой к пользователю
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ads (
-            ad_id TEXT,
-            chat_id INTEGER,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ad_id TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
             url TEXT,
             title TEXT,
             price TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (ad_id, chat_id),
-            FOREIGN KEY (chat_id) REFERENCES users(chat_id)
+            seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(ad_id, chat_id)
         )
     """)
     
-    # Индексы для ускорения поиска
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_ads_user ON ads(chat_id, ad_id)")
+    # Создаем индексы
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ads_chat_id ON ads(chat_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_ads_ad_id ON ads(ad_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)")
     
     conn.commit()
@@ -64,270 +72,505 @@ def init_db():
 db_conn, db_cur = init_db()
 
 # --- ФУНКЦИИ ДЛЯ РАБОТЫ С БД ---
-def save_ad(chat_id, ad_id, url, title, price):
+def save_ad_to_db(chat_id, ad_id, url, title, price):
     """Сохранение объявления в БД"""
-    with db_lock:
-        db_cur.execute("""
-            INSERT OR IGNORE INTO ads (ad_id, chat_id, url, title, price)
-            VALUES (?, ?, ?, ?, ?)
-        """, (ad_id, chat_id, url, title, price))
-        db_conn.commit()
+    try:
+        with db_lock:
+            db_cur.execute("""
+                INSERT OR IGNORE INTO ads (ad_id, chat_id, url, title, price)
+                VALUES (?, ?, ?, ?, ?)
+            """, (ad_id, chat_id, url, title, price))
+            db_conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Ошибка сохранения в БД: {e}")
+        return False
 
 def is_ad_seen(chat_id, ad_id):
     """Проверка, видел ли пользователь это объявление"""
-    with db_lock:
-        db_cur.execute(
-            "SELECT 1 FROM ads WHERE chat_id = ? AND ad_id = ?",
-            (chat_id, ad_id)
-        )
-        return db_cur.fetchone() is not None
+    try:
+        with db_lock:
+            db_cur.execute(
+                "SELECT 1 FROM ads WHERE chat_id = ? AND ad_id = ? LIMIT 1",
+                (chat_id, ad_id)
+            )
+            return db_cur.fetchone() is not None
+    except Exception as e:
+        logger.error(f"Ошибка проверки БД: {e}")
+        return False
 
 def get_user_url(chat_id):
     """Получение URL пользователя"""
-    with db_lock:
-        db_cur.execute(
-            "SELECT url FROM users WHERE chat_id = ? AND active = 1",
-            (chat_id,)
-        )
-        result = db_cur.fetchone()
-        return result['url'] if result else None
+    try:
+        with db_lock:
+            db_cur.execute(
+                "SELECT url FROM users WHERE chat_id = ? AND active = 1",
+                (chat_id,)
+            )
+            result = db_cur.fetchone()
+            return result['url'] if result else None
+    except Exception as e:
+        logger.error(f"Ошибка получения URL: {e}")
+        return None
 
-def get_all_active_users():
+def get_active_users():
     """Получение всех активных пользователей"""
-    with db_lock:
-        db_cur.execute("SELECT chat_id, url FROM users WHERE active = 1")
-        return db_cur.fetchall()
+    try:
+        with db_lock:
+            db_cur.execute("SELECT chat_id, url FROM users WHERE active = 1")
+            return db_cur.fetchall()
+    except Exception as e:
+        logger.error(f"Ошибка получения пользователей: {e}")
+        return []
 
-# --- ФУНКЦИИ ДЛЯ ПАРСИНГА ---
-def get_avito_data(url, max_retries=3):
-    """Получение данных с Авито с повторными попытками"""
+def update_last_check(chat_id):
+    """Обновление времени последней проверки"""
+    try:
+        with db_lock:
+            db_cur.execute(
+                "UPDATE users SET last_check = CURRENT_TIMESTAMP WHERE chat_id = ?",
+                (chat_id,)
+            )
+            db_conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка обновления времени: {e}")
+
+# --- ФУНКЦИИ ДЛЯ ПАРСИНГА АВИТО ---
+def get_random_user_agent():
+    """Генерация случайного User-Agent"""
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    ]
+    return random.choice(user_agents)
+
+def parse_avito_page(url, max_retries=3):
+    """Парсинг страницы Авито с улучшенной обработкой"""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
+        'User-Agent': get_random_user_agent(),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Cache-Control': 'max-age=0',
+        'Referer': 'https://www.avito.ru/',
+        'DNT': '1',
     }
     
     for attempt in range(max_retries):
         try:
-            session = requests.Session()
-            # Добавляем случайную задержку между запросами
-            time.sleep(random.uniform(1, 3))
+            logger.info(f"Попытка {attempt + 1} парсинга {url}")
             
-            resp = session.get(
+            # Задержка перед запросом
+            time.sleep(random.uniform(2, 5))
+            
+            response = requests.get(
                 url,
                 headers=headers,
-                impersonate="chrome110",
-                timeout=30
+                proxies=PROXIES,
+                timeout=15,
+                verify=True
             )
             
-            logger.info(f"Статус код: {resp.status_code} для {url}")
+            logger.info(f"Статус: {response.status_code}, Размер: {len(response.text)} байт")
             
-            if resp.status_code == 403:
-                logger.warning(f"Доступ запрещен (403) для {url}")
-                return None, []
-            if resp.status_code != 200:
-                logger.warning(f"Неверный статус код: {resp.status_code}")
+            if response.status_code != 200:
+                logger.warning(f"Неверный статус: {response.status_code}")
                 if attempt < max_retries - 1:
-                    time.sleep(5)
+                    time.sleep(10)
                     continue
                 return None, []
             
-            soup = BeautifulSoup(resp.content, 'html.parser')
+            soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Получаем данные из JSON
-            catalog_info = {}
-            script = soup.find("script", string=re.compile(r"window\.__initialData__\s*="))
-            if script:
-                try:
-                    script_text = script.string
-                    # Ищем JSON данные
-                    match = re.search(r'window\.__initialData__\s*=\s*(.*?);', script_text, re.DOTALL)
-                    if match:
-                        data_str = match.group(1)
-                        # Убираем возможные escape-последовательности
-                        if data_str.startswith('"') and data_str.endswith('"'):
-                            data_str = urllib.parse.unquote(data_str[1:-1])
-                        data = json.loads(data_str)
-                        
-                        # Ищем каталог с объявлениями
-                        def find_catalog(obj):
-                            if isinstance(obj, dict):
-                                if 'items' in obj and isinstance(obj['items'], list) and len(obj['items']) > 0:
-                                    first_item = obj['items'][0]
-                                    if isinstance(first_item, dict) and 'id' in first_item:
-                                        return obj['items']
-                                for value in obj.values():
-                                    result = find_catalog(value)
-                                    if result:
-                                        return result
-                            elif isinstance(obj, list):
-                                for item in obj:
-                                    result = find_catalog(item)
-                                    if result:
-                                        return result
-                            return None
-                        
-                        items_data = find_catalog(data)
-                        if items_data:
-                            for item in items_data:
-                                if isinstance(item, dict) and 'id' in item:
-                                    item_id = str(item.get('id'))
-                                    catalog_info[item_id] = {
-                                        'desc': item.get('description', '').replace('\n', ' ').strip(),
-                                        'img': item.get('images', [{}])[0].get('636x476') if item.get('images') else None
-                                    }
-                except Exception as e:
-                    logger.error(f"Ошибка при парсинге JSON: {e}")
+            # Проверяем на блокировку
+            if "Доступ ограничен" in response.text or "blocked" in response.text.lower():
+                logger.error("Авито заблокировал доступ")
+                return None, []
             
-            # Парсим HTML
-            items = soup.find_all('div', {'data-marker': re.compile(r'^item(-\d+)?$')})
-            logger.info(f"Найдено {len(items)} объявлений на странице")
+            # Способ 1: Ищем объявления через data-marker
+            items = soup.find_all('div', {'data-marker': re.compile(r'item')})
+            logger.info(f"Найдено объявлений (способ 1): {len(items)}")
             
-            return catalog_info, items
+            # Способ 2: Если первый способ не нашел, ищем по классам
+            if not items:
+                items = soup.find_all('div', class_=re.compile(r'iva-item-body|item'))
+                logger.info(f"Найдено объявлений (способ 2): {len(items)}")
+            
+            # Способ 3: Ищем в JSON данных
+            script_data = {}
+            scripts = soup.find_all('script')
+            for script in scripts:
+                if script.string and 'window.__initialData__' in script.string:
+                    try:
+                        script_content = script.string
+                        # Ищем JSON структуру
+                        match = re.search(r'window\.__initialData__\s*=\s*(.*?);\s*$', script_content, re.MULTILINE | re.DOTALL)
+                        if match:
+                            json_str = match.group(1).strip()
+                            # Убираем лишние кавычки
+                            if json_str.startswith('"') and json_str.endswith('"'):
+                                json_str = json_str[1:-1]
+                                json_str = urllib.parse.unquote(json_str)
+                            
+                            data = json.loads(json_str)
+                            # Ищем каталог
+                            def find_items(obj, path=""):
+                                if isinstance(obj, dict):
+                                    if 'items' in obj and isinstance(obj['items'], list):
+                                        if obj['items'] and isinstance(obj['items'][0], dict) and 'id' in obj['items'][0]:
+                                            return obj['items']
+                                    for key, value in obj.items():
+                                        result = find_items(value, f"{path}.{key}")
+                                        if result:
+                                            return result
+                                elif isinstance(obj, list):
+                                    for i, item in enumerate(obj):
+                                        result = find_items(item, f"{path}[{i}]")
+                                        if result:
+                                            return result
+                                return None
+                            
+                            items_data = find_items(data)
+                            if items_data:
+                                for item in items_data:
+                                    if isinstance(item, dict) and 'id' in item:
+                                        item_id = str(item['id'])
+                                        script_data[item_id] = {
+                                            'title': item.get('title', ''),
+                                            'description': item.get('description', ''),
+                                            'price': item.get('price', ''),
+                                            'images': item.get('images', []),
+                                            'url': item.get('url', '')
+                                        }
+                    except Exception as e:
+                        logger.error(f"Ошибка парсинга JSON: {e}")
+                        continue
+            
+            # Если ни один способ не нашел объявления, сохраняем HTML для отладки
+            if not items:
+                logger.error("Не найдено объявлений ни одним способом")
+                with open(f"debug_{int(time.time())}.html", "w", encoding="utf-8") as f:
+                    f.write(response.text[:10000])
+            
+            return script_data, items
             
         except requests.exceptions.Timeout:
-            logger.warning(f"Таймаут при запросе (попытка {attempt + 1}/{max_retries})")
+            logger.warning(f"Таймаут при запросе (попытка {attempt + 1})")
             if attempt < max_retries - 1:
                 time.sleep(10)
                 continue
-        except Exception as e:
-            logger.error(f"Ошибка при парсинге: {e}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Ошибка сети: {e}")
             if attempt < max_retries - 1:
-                time.sleep(5)
+                time.sleep(15)
+                continue
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(10)
                 continue
     
     return None, []
 
-def send_ad(chat_id, item, info):
-    """Отправка объявления в Telegram"""
+def extract_ad_info(item, script_data):
+    """Извлечение информации из объявления"""
     try:
-        ad_id = str(item.get('data-item-id') or item.get('data-marker', '').replace('item-', ''))
-        if not ad_id or ad_id == 'item':
-            logger.warning("Не удалось получить ID объявления")
-            return
+        # Получаем ID объявления
+        ad_id = None
         
-        # Проверяем, не видел ли пользователь уже это объявление
-        if is_ad_seen(chat_id, ad_id):
-            logger.debug(f"Объявление {ad_id} уже было отправлено пользователю {chat_id}")
-            return
+        # Способ 1: из data-item-id
+        if item.has_attr('data-item-id'):
+            ad_id = item.get('data-item-id')
         
-        title_tag = item.find('a', {'data-marker': 'item-title'})
-        if not title_tag:
-            return
+        # Способ 2: из data-marker
+        if not ad_id and item.has_attr('data-marker'):
+            marker = item.get('data-marker', '')
+            if marker.startswith('item-'):
+                ad_id = marker.replace('item-', '')
         
-        title = title_tag.get('title', '')
-        title = re.sub(r'купить (в|на)?.*?(на Авито|Авито)?$', '', title, flags=re.IGNORECASE).strip()
+        # Способ 3: ищем в содержимом
+        if not ad_id:
+            id_elem = item.find('a', {'data-marker': 'item-title'})
+            if id_elem and id_elem.get('href'):
+                match = re.search(r'/(\d+)$', id_elem.get('href'))
+                if match:
+                    ad_id = match.group(1)
         
-        # Пробуем разные способы получить цену
+        if not ad_id:
+            logger.warning("Не удалось извлечь ID объявления")
+            return None
+        
+        # Получаем заголовок
+        title_elem = item.find('a', {'data-marker': 'item-title'})
+        if not title_elem:
+            title_elem = item.find('h3', class_=re.compile(r'title|item-title'))
+        
+        title = title_elem.get_text(strip=True) if title_elem else "Без названия"
+        
+        # Получаем цену
         price_elem = item.find('meta', {'itemprop': 'price'})
         if price_elem:
             price = price_elem.get('content', '')
         else:
             price_elem = item.find('span', {'data-marker': 'item-price'})
             if price_elem:
-                price = price_elem.text.strip()
+                price = price_elem.get_text(strip=True)
             else:
-                price = "Цена не указана"
+                price_elem = item.find('p', class_=re.compile(r'price|item-price'))
+                price = price_elem.get_text(strip=True) if price_elem else "Цена не указана"
         
-        if price and price.isdigit():
-            price = f"{int(price):,} ₽".replace(",", " ")
+        # Форматируем цену
+        if price and re.search(r'\d', price):
+            price = re.sub(r'\s+', ' ', price.strip())
         
-        link = "https://www.avito.ru" + title_tag['href']
+        # Получаем ссылку
+        if title_elem and title_elem.get('href'):
+            link = "https://www.avito.ru" + title_elem['href']
+        else:
+            link = f"https://www.avito.ru/{ad_id}"
         
-        extra = info.get(ad_id, {})
+        # Получаем дополнительные данные из script_data
+        extra_data = script_data.get(ad_id, {})
         
-        # Ищем изображение
-        photo = None
-        img_elem = item.find('img')
-        if img_elem:
-            photo = img_elem.get('src') or img_elem.get('data-src')
-        
-        if not photo and extra.get('img'):
-            photo = extra['img']
-        
-        description = extra.get('desc', '')
+        # Получаем описание
+        description = extra_data.get('description', '')
         if not description:
-            desc_elem = item.find('div', {'class': re.compile(r'description|item-description')})
+            desc_elem = item.find('div', class_=re.compile(r'description|item-description-step-two'))
             if desc_elem:
-                description = desc_elem.text.strip()[:350]
+                description = desc_elem.get_text(strip=True)[:300]
+        
+        # Получаем изображение
+        image_url = None
+        if extra_data.get('images'):
+            image_url = extra_data['images'][0].get('640x480') or extra_data['images'][0].get('url', '')
+        
+        if not image_url:
+            img_elem = item.find('img')
+            if img_elem:
+                image_url = img_elem.get('src') or img_elem.get('data-src', '')
+        
+        return {
+            'id': ad_id,
+            'title': title,
+            'price': price,
+            'url': link,
+            'description': description,
+            'image': image_url,
+            'extra': extra_data
+        }
+        
+    except Exception as e:
+        logger.error(f"Ошибка извлечения информации: {e}")
+        return None
+
+def send_ad_to_user(chat_id, ad_info):
+    """Отправка объявления пользователю"""
+    try:
+        if not ad_info:
+            return False
+        
+        # Проверяем, не отправляли ли уже это объявление
+        if is_ad_seen(chat_id, ad_info['id']):
+            logger.debug(f"Объявление {ad_info['id']} уже было отправлено")
+            return False
         
         # Формируем сообщение
-        caption = (f"<b>{title}</b>\n"
-                   f"💰 <b>{price}</b>\n"
-                   f"🔗 <a href='{link}'>Открыть на Avito</a>\n")
+        caption = (f"<b>{ad_info['title']}</b>\n\n"
+                  f"💰 <b>{ad_info['price']}</b>\n\n")
         
-        if description:
-            caption += f"\n📝 {description[:350]}{'...' if len(description) > 350 else ''}"
+        if ad_info['description']:
+            caption += f"📝 {ad_info['description']}\n\n"
         
-        caption += "\n________________________"
+        caption += f"🔗 <a href='{ad_info['url']}'>Смотреть на Авито</a>"
         
         # Отправляем сообщение
         try:
-            if photo and photo.startswith(('http://', 'https://')):
+            if ad_info['image'] and ad_info['image'].startswith('http'):
                 msg = bot.send_photo(
-                    chat_id,
-                    photo,
+                    chat_id=chat_id,
+                    photo=ad_info['image'],
                     caption=caption,
-                    parse_mode="HTML",
+                    parse_mode='HTML',
                     reply_markup=main_menu()
                 )
             else:
                 msg = bot.send_message(
-                    chat_id,
-                    caption,
-                    parse_mode="HTML",
-                    reply_markup=main_menu()
+                    chat_id=chat_id,
+                    text=caption,
+                    parse_mode='HTML',
+                    reply_markup=main_menu(),
+                    disable_web_page_preview=False
                 )
             
-            # Сохраняем в БД после успешной отправки
-            save_ad(chat_id, ad_id, link, title, price)
-            logger.info(f"Отправлено объявление {ad_id} пользователю {chat_id}")
+            logger.info(f"Отправлено объявление {ad_info['id']} пользователю {chat_id}")
             
-        except Exception as e:
-            logger.error(f"Ошибка при отправке сообщения: {e}")
+            # Сохраняем в БД
+            save_ad_to_db(
+                chat_id,
+                ad_info['id'],
+                ad_info['url'],
+                ad_info['title'],
+                ad_info['price']
+            )
+            
+            return True
+            
+        except Exception as send_error:
+            logger.error(f"Ошибка отправки: {send_error}")
             # Пробуем отправить без фото
             try:
                 msg = bot.send_message(
-                    chat_id,
-                    caption,
-                    parse_mode="HTML",
+                    chat_id=chat_id,
+                    text=caption,
+                    parse_mode='HTML',
                     reply_markup=main_menu()
                 )
-                save_ad(chat_id, ad_id, link, title, price)
-            except Exception as e2:
-                logger.error(f"Не удалось отправить даже текст: {e2}")
-    
+                save_ad_to_db(
+                    chat_id,
+                    ad_info['id'],
+                    ad_info['url'],
+                    ad_info['title'],
+                    ad_info['price']
+                )
+                return True
+            except Exception as e:
+                logger.error(f"Не удалось отправить даже текст: {e}")
+                return False
+                
     except Exception as e:
-        logger.error(f"Ошибка в send_ad: {e}")
+        logger.error(f"Ошибка в send_ad_to_user: {e}")
+        return False
 
 # --- КНОПКИ И ОБРАБОТЧИКИ ---
 def main_menu():
     """Создание меню с кнопками"""
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    btn_stop = types.KeyboardButton("❌ Остановить мониторинг")
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    btn_stop = types.KeyboardButton("❌ Остановить")
     btn_status = types.KeyboardButton("📊 Статус")
-    markup.add(btn_stop, btn_status)
+    btn_test = types.KeyboardButton("🔍 Проверить сейчас")
+    markup.add(btn_status, btn_test, btn_stop)
     return markup
 
 @bot.message_handler(commands=['start', 'help'])
 def welcome(message):
     """Приветственное сообщение"""
+    welcome_text = (
+        "👋 <b>Avito Monitor Bot</b>\n\n"
+        "Я помогу отслеживать новые объявления на Avito!\n\n"
+        "📌 <b>Как использовать:</b>\n"
+        "1. Пришли мне ссылку на поиск Avito\n"
+        "2. Я начну отслеживать новые объявления\n"
+        "3. Получай уведомления о новых предложениях\n\n"
+        "🔧 <b>Команды:</b>\n"
+        "/start - показать это сообщение\n"
+        "/test <url> - протестировать парсинг\n"
+        "/stats - статистика\n\n"
+        "⚠️ <b>Внимание:</b> Avito может блокировать частые запросы. "
+        "Интервал проверки: 5-10 минут."
+    )
+    
     bot.send_message(
         message.chat.id,
-        "👋 Привет! Я бот для мониторинга новых объявлений на Авито.\n\n"
-        "📌 Просто пришли мне ссылку на поиск Авито (например: https://www.avito.ru/...)\n"
-        "Я начну отслеживать новые объявления и присылать их тебе.\n\n"
-        "❌ Для остановки мониторинга нажми кнопку ниже.",
+        welcome_text,
+        parse_mode='HTML',
         reply_markup=main_menu()
     )
 
-@bot.message_handler(func=lambda m: m.text == "❌ Остановить мониторинг")
+@bot.message_handler(commands=['test'])
+def test_parsing(message):
+    """Тестирование парсинга"""
+    chat_id = message.chat.id
+    
+    # Проверяем, есть ли ссылка в команде
+    parts = message.text.split()
+    if len(parts) > 1:
+        url = parts[1]
+    else:
+        # Берем сохраненную ссылку
+        url = get_user_url(chat_id)
+        if not url:
+            bot.reply_to(message, "❌ Сначала пришли ссылку для мониторинга")
+            return
+    
+    bot.send_message(chat_id, "🔍 Тестирую парсинг...")
+    
+    try:
+        script_data, items = parse_avito_page(url)
+        
+        if not items:
+            bot.send_message(chat_id, "❌ Не удалось найти объявления. Проверьте ссылку.")
+            return
+        
+        bot.send_message(chat_id, f"✅ Найдено объявлений: {len(items)}")
+        
+        # Показываем первое объявление
+        if items:
+            ad_info = extract_ad_info(items[0], script_data)
+            if ad_info:
+                send_ad_to_user(chat_id, ad_info)
+            else:
+                bot.send_message(chat_id, "⚠️ Не удалось извлечь информацию из первого объявления")
+        
+        # Сохраняем все ID для будущих проверок
+        for i, item in enumerate(items[:10]):
+            ad_info = extract_ad_info(item, script_data)
+            if ad_info and ad_info['id']:
+                save_ad_to_db(
+                    chat_id,
+                    ad_info['id'],
+                    ad_info['url'],
+                    ad_info['title'],
+                    ad_info['price']
+                )
+        
+        bot.send_message(chat_id, "✅ Тест завершен. ID объявлений сохранены.")
+        
+    except Exception as e:
+        logger.error(f"Ошибка теста: {e}")
+        bot.send_message(chat_id, f"❌ Ошибка: {str(e)}")
+
+@bot.message_handler(commands=['stats'])
+def show_stats(message):
+    """Показать статистику"""
+    chat_id = message.chat.id
+    
+    with db_lock:
+        db_cur.execute(
+            "SELECT COUNT(*) as total FROM ads WHERE chat_id = ?",
+            (chat_id,)
+        )
+        total_ads = db_cur.fetchone()['total']
+        
+        db_cur.execute(
+            "SELECT url, active, last_check FROM users WHERE chat_id = ?",
+            (chat_id,)
+        )
+        user_info = db_cur.fetchone()
+    
+    if user_info:
+        status = "✅ Активен" if user_info['active'] else "❌ Остановлен"
+        stats_text = (
+            f"📊 <b>Статистика</b>\n\n"
+            f"Статус: {status}\n"
+            f"Всего объявлений: {total_ads}\n"
+            f"Последняя проверка: {user_info['last_check']}\n"
+            f"Ссылка: {user_info['url'][:50]}..."
+        )
+    else:
+        stats_text = "❌ Мониторинг не настроен. Пришлите ссылку."
+    
+    bot.send_message(chat_id, stats_text, parse_mode='HTML', reply_markup=main_menu())
+
+@bot.message_handler(func=lambda m: m.text == "❌ Остановить")
 def stop_monitoring(message):
     """Остановка мониторинга"""
     chat_id = message.chat.id
+    
     with db_lock:
         db_cur.execute(
             "UPDATE users SET active = 0 WHERE chat_id = ?",
@@ -337,157 +580,216 @@ def stop_monitoring(message):
     
     bot.send_message(
         chat_id,
-        "⏹ Мониторинг остановлен. Твоя ссылка удалена.\n"
-        "Чтобы начать заново — просто пришли новую ссылку.",
+        "⏹ Мониторинг остановлен.\n"
+        "Для возобновления пришлите новую ссылку.",
         reply_markup=types.ReplyKeyboardRemove()
     )
-    logger.info(f"Мониторинг остановлен для пользователя {chat_id}")
+    logger.info(f"Мониторинг остановлен для {chat_id}")
 
 @bot.message_handler(func=lambda m: m.text == "📊 Статус")
-def show_status(message):
-    """Показ статуса мониторинга"""
+def status_handler(message):
+    """Обработчик кнопки статуса"""
+    show_stats(message)
+
+@bot.message_handler(func=lambda m: m.text == "🔍 Проверить сейчас")
+def check_now_handler(message):
+    """Принудительная проверка"""
     chat_id = message.chat.id
     url = get_user_url(chat_id)
     
-    if url:
-        with db_lock:
-            db_cur.execute(
-                "SELECT COUNT(*) as count FROM ads WHERE chat_id = ?",
-                (chat_id,)
-            )
-            count = db_cur.fetchone()['count']
-        
-        bot.send_message(
-            chat_id,
-            f"✅ Мониторинг активен\n"
-            f"📊 Всего получено объявлений: {count}\n"
-            f"🔗 Отслеживаемая ссылка: {url[:50]}...",
-            reply_markup=main_menu()
-        )
-    else:
-        bot.send_message(
-            chat_id,
-            "❌ Мониторинг не активен. Пришли ссылку для начала отслеживания.",
-            reply_markup=main_menu()
-        )
+    if not url:
+        bot.send_message(chat_id, "❌ Сначала настройте мониторинг")
+        return
+    
+    bot.send_message(chat_id, "🔄 Проверяю сейчас...")
+    
+    # Запускаем проверку в отдельном потоке
+    def check():
+        try:
+            script_data, items = parse_avito_page(url)
+            new_count = 0
+            
+            if items:
+                for item in items[:20]:  # Проверяем первые 20
+                    ad_info = extract_ad_info(item, script_data)
+                    if ad_info and send_ad_to_user(chat_id, ad_info):
+                        new_count += 1
+                        time.sleep(1)  # Задержка между отправками
+            
+            if new_count > 0:
+                bot.send_message(chat_id, f"✅ Найдено новых: {new_count}")
+            else:
+                bot.send_message(chat_id, "✅ Новых объявлений нет")
+                
+        except Exception as e:
+            logger.error(f"Ошибка проверки: {e}")
+            bot.send_message(chat_id, f"❌ Ошибка: {str(e)}")
+    
+    Thread(target=check, daemon=True).start()
 
 @bot.message_handler(func=lambda m: "avito.ru" in m.text.lower())
-def set_link(message):
-    """Установка ссылки для мониторинга"""
+def handle_avito_link(message):
+    """Обработка ссылки на Авито"""
     chat_id = message.chat.id
     url = message.text.strip()
     
-    # Проверяем, что это валидная ссылка на Авито
+    # Валидация URL
     if not re.match(r'^https?://(www\.)?avito\.ru/.+', url):
-        bot.reply_to(message, "❌ Это не похоже на ссылку Авито. Пришли корректную ссылку.")
+        bot.reply_to(message, "❌ Неверная ссылка. Нужна ссылка на поиск Avito.")
         return
     
     # Сохраняем пользователя
     with db_lock:
         db_cur.execute("""
-            INSERT OR REPLACE INTO users (chat_id, url, active)
-            VALUES (?, ?, 1)
+            INSERT OR REPLACE INTO users (chat_id, url, active, last_check)
+            VALUES (?, ?, 1, CURRENT_TIMESTAMP)
         """, (chat_id, url))
         db_conn.commit()
     
     bot.send_message(
         chat_id,
-        "✅ Ссылка принята! Начинаю мониторинг...",
+        "✅ Ссылка сохранена! Начинаю мониторинг...\n"
+        "Проверяю первые объявления...",
         reply_markup=main_menu()
     )
-    logger.info(f"Начался мониторинг для пользователя {chat_id}")
     
-    # Парсим первые объявления
-    try:
-        info, items = get_avito_data(url)
-        if items:
-            count = 0
-            for item in items[:5]:  # Отправляем только первые 5
-                send_ad(chat_id, item, info)
-                count += 1
-                time.sleep(1)  # Задержка между отправками
+    # Тестируем парсинг и сохраняем первые объявления
+    def initial_scan():
+        try:
+            script_data, items = parse_avito_page(url)
+            
+            if not items:
+                bot.send_message(
+                    chat_id,
+                    "⚠️ Не удалось найти объявления. Проверьте ссылку."
+                )
+                return
+            
+            initial_count = 0
+            for item in items[:15]:  # Сохраняем первые 15
+                ad_info = extract_ad_info(item, script_data)
+                if ad_info and ad_info['id']:
+                    save_ad_to_db(
+                        chat_id,
+                        ad_info['id'],
+                        ad_info['url'],
+                        ad_info['title'],
+                        ad_info['price']
+                    )
+                    initial_count += 1
             
             bot.send_message(
                 chat_id,
-                f"✅ Мониторинг запущен! Первые {count} объявлений отправлены.\n"
-                f"Теперь я буду присылать только новые объявления.",
+                f"✅ Мониторинг запущен!\n"
+                f"Сохранено объявлений: {initial_count}\n"
+                f"Теперь буду присылать только новые.",
                 reply_markup=main_menu()
             )
-        else:
+            
+            # Отправляем первое объявление для примера
+            if items:
+                ad_info = extract_ad_info(items[0], script_data)
+                if ad_info:
+                    time.sleep(2)
+                    send_ad_to_user(chat_id, ad_info)
+                    
+        except Exception as e:
+            logger.error(f"Ошибка начального сканирования: {e}")
             bot.send_message(
                 chat_id,
-                "⚠️ Не удалось получить объявления. Проверьте ссылку или попробуйте позже.",
-                reply_markup=main_menu()
+                f"❌ Ошибка при обработке: {str(e)}"
             )
-    except Exception as e:
-        logger.error(f"Ошибка при первоначальном парсинге: {e}")
-        bot.send_message(
-            chat_id,
-            "❌ Ошибка при обработке ссылки. Попробуйте еще раз.",
-            reply_markup=main_menu()
-        )
+    
+    Thread(target=initial_scan, daemon=True).start()
 
-# --- ФУНКЦИЯ ПРОВЕРКИ ОБНОВЛЕНИЙ ---
-def check_updates():
-    """Фоновая проверка обновлений"""
-    logger.info("Запущен процесс проверки обновлений")
+# --- ФОНОВАЯ ПРОВЕРКА ---
+def check_for_new_ads():
+    """Фоновая проверка новых объявлений"""
+    logger.info("🚀 Фоновая проверка запущена")
     
     while True:
         try:
-            users = get_all_active_users()
-            logger.info(f"Проверка обновлений для {len(users)} пользователей")
+            users = get_active_users()
+            logger.info(f"Проверяем {len(users)} пользователей")
             
             for user in users:
                 chat_id = user['chat_id']
                 url = user['url']
                 
+                logger.info(f"Проверка для пользователя {chat_id}")
+                
                 try:
-                    info, items = get_avito_data(url)
-                    if items:
-                        new_ads = 0
-                        for item in items:
-                            if new_ads >= 10:  # Ограничение на количество новых объявлений за раз
-                                break
+                    # Парсим страницу
+                    script_data, items = parse_avito_page(url)
+                    
+                    if not items:
+                        logger.warning(f"Не найдено объявлений для {chat_id}")
+                        continue
+                    
+                    # Проверяем новые объявления
+                    new_ads = 0
+                    for item in items[:25]:  # Проверяем первые 25
+                        ad_info = extract_ad_info(item, script_data)
+                        if ad_info and not is_ad_seen(chat_id, ad_info['id']):
+                            logger.info(f"Новое объявление {ad_info['id']} для {chat_id}")
                             
-                            send_ad(chat_id, item, info)
-                            if not is_ad_seen(chat_id, str(item.get('data-item-id'))):
+                            # Отправляем объявление
+                            if send_ad_to_user(chat_id, ad_info):
                                 new_ads += 1
-                                # Задержка между отправками, чтобы не спамить
-                                time.sleep(random.uniform(2, 4))
-                        
-                        if new_ads > 0:
-                            logger.info(f"Отправлено {new_ads} новых объявлений пользователю {chat_id}")
+                            
+                            # Задержка между отправками
+                            if new_ads < 5:  # Первые 5 сразу
+                                time.sleep(random.uniform(3, 7))
+                            else:  # Остальные с большей задержкой
+                                time.sleep(random.uniform(10, 20))
+                            
+                            # Если уже много новых, делаем паузу
+                            if new_ads >= 10:
+                                logger.info(f"Много новых объявлений ({new_ads}) для {chat_id}")
+                                break
+                    
+                    if new_ads > 0:
+                        logger.info(f"Отправлено {new_ads} новых объявлений пользователю {chat_id}")
+                    
+                    # Обновляем время проверки
+                    update_last_check(chat_id)
                     
                     # Случайная задержка между пользователями
-                    time.sleep(random.uniform(5, 15))
+                    time.sleep(random.uniform(15, 30))
                     
                 except Exception as e:
-                    logger.error(f"Ошибка при проверке для пользователя {chat_id}: {e}")
+                    logger.error(f"Ошибка для пользователя {chat_id}: {e}")
+                    time.sleep(30)
                     continue
             
-            # Пауза между циклами проверки (3-5 минут)
-            sleep_time = random.randint(180, 300)
-            logger.info(f"Следующая проверка через {sleep_time} секунд")
+            # Пауза между циклами (5-10 минут)
+            sleep_time = random.randint(300, 600)
+            logger.info(f"Следующая проверка через {sleep_time // 60} минут")
             time.sleep(sleep_time)
             
         except Exception as e:
-            logger.error(f"Критическая ошибка в check_updates: {e}")
+            logger.error(f"Критическая ошибка в фоновой проверке: {e}")
             time.sleep(60)
 
 # --- ЗАПУСК БОТА ---
 if __name__ == "__main__":
-    import threading
-    
-    # Запускаем фоновую проверку в отдельном потоке
-    monitor_thread = threading.Thread(target=check_updates, daemon=True)
+    # Запускаем фоновую проверку
+    monitor_thread = Thread(target=check_for_new_ads, daemon=True)
     monitor_thread.start()
     
-    logger.info("🚀 Бот запущен!")
+    logger.info("🤖 Бот запущен!")
+    logger.info(f"Токен: {TOKEN[:10]}...")
     
-    # Запускаем бота с обработкой ошибок
+    # Основной цикл бота
     while True:
         try:
-            bot.polling(none_stop=True, interval=1, timeout=30)
+            logger.info("Запуск polling...")
+            bot.polling(
+                none_stop=True,
+                interval=1,
+                timeout=30,
+                long_polling_timeout=30
+            )
         except Exception as e:
-            logger.error(f"Ошибка в работе бота: {e}")
+            logger.error(f"Ошибка в основном цикле бота: {e}")
             time.sleep(10)

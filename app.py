@@ -74,9 +74,10 @@ def check_updates():
                         conn.commit()
                 time.sleep(10) # Большая пауза между пользователями
         except: pass
-        time.sleep(300) # Проверка раз в 5 минут
+        time.sleep(5) # Проверка раз в 5 минут
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=check_updates, daemon=True).start()
     bot.polling(none_stop=True)
+

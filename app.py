@@ -94,8 +94,17 @@ def set_link(message):
 def check_updates():
     while True:
         try:
+            # 1. Сначала пингуем сервер, чтобы он не заснул
+            try: requests.get("http://localhost:8000", timeout=5)
+            except: pass
+
             db_cur.execute("SELECT chat_id, url FROM users")
-            for chat_id, url in db_cur.fetchall():
+            users = db_cur.fetchall()
+            
+            for chat_id, url in users:
+                # 2. Небольшая пауза ПЕРЕД каждым запросом, чтобы не грузить CPU
+                time.sleep(2) 
+                
                 info, items = get_avito_data(url)
                 if items:
                     for item in items:
@@ -105,8 +114,15 @@ def check_updates():
                             send_ad(chat_id, item, info)
                             db_cur.execute("INSERT INTO ads (ad_id) VALUES (?)", (ad_id,))
                             db_conn.commit()
-        except: pass
-        time.sleep(random.randint(180, 300))
+                
+                # Даем боту "подышать" после обработки одного пользователя
+                time.sleep(5) 
+
+        except Exception as e:
+            print(f"Ошибка мониторинга: {e}")
+        
+        # 3. Увеличиваем общий отдых. 5-10 минут - это норма для бесплатного хостинга.
+        time.sleep(random.randint(300, 600))
 
 if __name__ == "__main__":
     # 1. Запуск веб-затычки для Koyeb
@@ -128,4 +144,5 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"⚠️ Ошибка связи: {e}")
             time.sleep(5)
+
 

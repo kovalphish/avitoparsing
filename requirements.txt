@@ -1,5 +1,23 @@
-pyTelegramBotAPI
-requests
-flask
-beautifulsoup4
+# Основные
+pyTelegramBotAPI==4.19.1
+requests==2.31.0
+beautifulsoup4==4.12.3
+Flask==3.0.2
 
+# Парсеры
+lxml==4.9.3
+
+# Для работы с данными
+python-dateutil==2.8.2
+pytz==2023.3.post1
+
+# Утилиты
+fake-useragent==1.4.0
+schedule==1.2.1
+
+# Логирование
+loguru==0.7.2  # Альтернатива стандартному logging
+
+# База данных (если будете использовать)
+# pymongo==4.6.0  # Для MongoDB
+# redis==5.0.1    # Для Redis кэша
